@@ -1,0 +1,45 @@
+name: Build Windows 10-11 EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-wpf:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Self-Contained EXE for Windows 10 & 11 (x64)
+        run: |
+          dotnet publish FastAndroidDataCopier.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o publish_out
+
+      - name: Zip Output
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish_out\* -DestinationPath FastAndroidDataCopier-Win10-Win11-x64.zip -Force
+
+      - name: Upload Artifact (Download from Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastAndroidDataCopier-Win10-Win11-x64
+          path: FastAndroidDataCopier-Win10-Win11-x64.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.0-Pro
+          name: "FastAndroidDataCopier Pro v2.0 (Windows 10 & 11)"
+          files: FastAndroidDataCopier-Win10-Win11-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
