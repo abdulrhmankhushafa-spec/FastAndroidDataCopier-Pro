@@ -1,0 +1,54 @@
+name: Build Windows 10-11 EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-wpf:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Self-Contained EXE for Windows 10 & 11 (x64)
+        run: |
+          dotnet publish FastAndroidDataCopier.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o publish_out
+
+      - name: Bundle Official Android ADB inside package
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "platform-tools.zip"
+          Expand-Archive -Path "platform-tools.zip" -DestinationPath "pt_extracted" -Force
+          Copy-Item "pt_extracted\platform-tools\adb.exe" "publish_out\" -Force
+          Copy-Item "pt_extracted\platform-tools\AdbWinApi.dll" "publish_out\" -Force
+          Copy-Item "pt_extracted\platform-tools\AdbWinUsbApi.dll" "publish_out\" -Force
+
+      - name: Zip Output
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish_out\* -DestinationPath FastAndroidDataCopier-Win10-Win11-x64.zip -Force
+
+      - name: Upload Artifact (Download from Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastAndroidDataCopier-Win10-Win11-x64
+          path: FastAndroidDataCopier-Win10-Win11-x64.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.2-Pro
+          name: "FastAndroidDataCopier Pro v2.2 (With Built-in ADB + Phone Browser)"
+          files: FastAndroidDataCopier-Win10-Win11-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
