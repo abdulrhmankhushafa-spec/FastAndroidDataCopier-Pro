@@ -26,9 +26,10 @@ namespace FastAndroidDataCopier
             Loaded += async (_, __) => await LoadDirectoriesAsync(SelectedPath);
         }
 
-        private static string NormalizeRemotePath(string path)
+        public static string NormalizeRemotePath(string path)
         {
-            string p = path.Trim().Replace('\\', '/');
+            string p = (path ?? "/sdcard/").Trim().Replace('\\', '/');
+            if (string.IsNullOrWhiteSpace(p)) p = "/sdcard/";
             if (!p.StartsWith("/")) p = "/" + p;
             while (p.Contains("//")) p = p.Replace("//", "/");
             if (!p.EndsWith("/")) p += "/";
@@ -45,29 +46,67 @@ namespace FastAndroidDataCopier
 
             try
             {
-                await RunAdbAsync($"-s {_serial} shell mkdir -p \"{norm}\"");
-                string cmd = $"-s {_serial} shell \"cd '{norm}' 2>/dev/null && for d in */ .*/; do [ -d \\\"$d\\\" ] && echo \\\"$d\\\"; done\"";
-                var (code, stdout, _) = await RunAdbAsync(cmd);
+                string escapedNorm = norm.Replace("\"", "\\\"");
+                await RunAdbAsync($"-s {_serial} shell mkdir -p \"{escapedNorm}\"");
 
-                var dirs = new List<string>();
-                if (code == 0 && !string.IsNullOrWhiteSpace(stdout))
+                var (_, stdout1, _) = await RunAdbAsync($"-s {_serial} shell ls -1 -p \"{escapedNorm}\"");
+
+                var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                if (!string.IsNullOrWhiteSpace(stdout1))
                 {
-                    foreach (var raw in stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    foreach (var raw in stdout1.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
                     {
-                        string name = raw.Trim().TrimEnd('/');
-                        if (name == "." || name == ".." || name == "*" || name == ".*") continue;
-                        dirs.Add(name);
+                        string line = raw.Trim();
+                        if (line.StartsWith("ls:", StringComparison.OrdinalIgnoreCase) ||
+                            line.Contains("Permission denied", StringComparison.OrdinalIgnoreCase) ||
+                            line.Contains("No such file", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        if (line.EndsWith("/"))
+                        {
+                            string folder = line.TrimEnd('/');
+                            if (!string.IsNullOrWhiteSpace(folder) && folder != "." && folder != "..")
+                            {
+                                dirs.Add(folder);
+                            }
+                        }
                     }
                 }
 
-                foreach (var d in dirs.Distinct().OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                if (dirs.Count == 0)
+                {
+                    var (_, stdout2, _) = await RunAdbAsync($"-s {_serial} shell find \"{escapedNorm}\" -maxdepth 1 -mindepth 1 -type d");
+                    if (!string.IsNullOrWhiteSpace(stdout2))
+                    {
+                        foreach (var raw in stdout2.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            string line = raw.Trim();
+                            if (line.StartsWith("find:", StringComparison.OrdinalIgnoreCase) ||
+                                line.Contains("Permission denied", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            string cleaned = line.TrimEnd('/');
+                            int lastSlash = cleaned.LastIndexOf('/');
+                            string name = lastSlash >= 0 ? cleaned.Substring(lastSlash + 1) : cleaned;
+                            if (!string.IsNullOrWhiteSpace(name) && name != "." && name != "..")
+                            {
+                                dirs.Add(name);
+                            }
+                        }
+                    }
+                }
+
+                foreach (var d in dirs.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                 {
                     LstFolders.Items.Add($"📁 {d}");
                 }
 
                 TxtBrowserStatus.Text = dirs.Count > 0
-                    ? $"تم العثور على {dirs.Count} مجلد فرعي داخل {norm}"
-                    : $"المجلد {norm} فارغ حالياً (لا توجد مجلدات فرعية بداخله).";
+                    ? $"✅ تم العثور على {dirs.Count} مجلد داخل {norm} (انقر مرتين للدخول أو اضغط اعتماد المسار)."
+                    : $"📂 المجلد {norm} جاهز للنسخ (لا توجد مجلدات فرعية ظاهرة بداخله).";
             }
             catch (Exception ex)
             {
@@ -86,6 +125,11 @@ namespace FastAndroidDataCopier
                     await LoadDirectoriesAsync(nextPath);
                 }
             }
+        }
+
+        private async void BtnRefreshDir_Click(object sender, RoutedEventArgs e)
+        {
+            await LoadDirectoriesAsync(TxtCurrentRemotePath.Text);
         }
 
         private async void BtnUp_Click(object sender, RoutedEventArgs e)
@@ -125,7 +169,8 @@ namespace FastAndroidDataCopier
             }
 
             string target = NormalizeRemotePath(TxtCurrentRemotePath.Text) + newName + "/";
-            await RunAdbAsync($"-s {_serial} shell mkdir -p \"{target}\"");
+            string escapedTarget = target.Replace("\"", "\\\"");
+            await RunAdbAsync($"-s {_serial} shell mkdir -p \"{escapedTarget}\"");
             TxtNewFolderName.Text = "";
             await LoadDirectoriesAsync(target);
         }
@@ -135,21 +180,17 @@ namespace FastAndroidDataCopier
             if (LstFolders.SelectedItem is string item)
             {
                 string sub = item.Replace("📁 ", "").Trim();
+                string openPath = NormalizeRemotePath(TxtCurrentRemotePath.Text);
+                string subPath = openPath + sub + "/";
+
                 var res = MessageBox.Show(
-                    $"هل تريد النسخ داخل المجلد المحدد ({sub}) أم داخل المسار المفتوح حالياً ({TxtCurrentRemotePath.Text})؟\n\nاضغط (نعم / Yes) للنسخ داخل: {NormalizeRemotePath(TxtCurrentRemotePath.Text)}{sub}/\nاضغط (لا / No) للنسخ داخل: {NormalizeRemotePath(TxtCurrentRemotePath.Text)}",
+                    $"لديك مجلد محدد في القائمة ({sub}).\n\n• اضغط (نعم / Yes) للنسخ داخل المجلد المحدد:\n{subPath}\n\n• اضغط (لا / No) للنسخ داخل المسار المفتوح حالياً:\n{openPath}",
                     "تأكيد مسار الوجهة",
                     MessageBoxButton.YesNoCancel,
                     MessageBoxImage.Question);
 
                 if (res == MessageBoxResult.Cancel) return;
-                if (res == MessageBoxResult.Yes)
-                {
-                    SelectedPath = NormalizeRemotePath(TxtCurrentRemotePath.Text) + sub + "/";
-                }
-                else
-                {
-                    SelectedPath = NormalizeRemotePath(TxtCurrentRemotePath.Text);
-                }
+                SelectedPath = (res == MessageBoxResult.Yes) ? subPath : openPath;
             }
             else
             {
