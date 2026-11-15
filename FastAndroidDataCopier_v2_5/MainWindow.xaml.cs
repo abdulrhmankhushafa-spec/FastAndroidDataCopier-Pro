@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -23,6 +24,7 @@ namespace FastAndroidDataCopier
         private long _totalFolderBytes = 0;
         private readonly DispatcherTimer _autoDetectTimer;
         private bool _isScanningDevices = false;
+        private int _activeTransferCount = 0;
         private string _resolvedAdbPath = "";
         private bool _adbServerStarted = false;
 
@@ -33,7 +35,7 @@ namespace FastAndroidDataCopier
 
             _autoDetectTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromSeconds(2.0)
+                Interval = TimeSpan.FromSeconds(2.5)
             };
             _autoDetectTimer.Tick += AutoDetectTimer_Tick;
 
@@ -191,6 +193,12 @@ namespace FastAndroidDataCopier
 
         private async void BtnRestartAdbServer_Click(object sender, RoutedEventArgs e)
         {
+            if (_activeTransferCount > 0)
+            {
+                MessageBox.Show("يرجى إيقاف عملية النسخ الجارية أولاً قبل إعادة تشغيل خادم ADB.", "تنبيه", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
             string? adbPath = EnsureAdbPath(promptIfMissing: true);
             if (adbPath == null) return;
 
@@ -316,6 +324,29 @@ namespace FastAndroidDataCopier
             return result;
         }
 
+        private static List<DirectoryInfo> EnumerateDirectoriesSafe(DirectoryInfo root)
+        {
+            var result = new List<DirectoryInfo>();
+            var stack = new Stack<DirectoryInfo>();
+            stack.Push(root);
+
+            while (stack.Count > 0)
+            {
+                var current = stack.Pop();
+                result.Add(current);
+                try
+                {
+                    foreach (var sub in current.GetDirectories())
+                    {
+                        stack.Push(sub);
+                    }
+                }
+                catch { }
+            }
+
+            return result;
+        }
+
         private long CalculateDirectorySize(DirectoryInfo dir)
         {
             long size = 0;
@@ -333,7 +364,10 @@ namespace FastAndroidDataCopier
 
             BtnRefreshDevices.IsEnabled = false;
             TxtGlobalStatus.Text = "🔍 جاري فحص منافذ USB والتعرف على جميع الهواتف المتصلة...";
-            await RunCommandCaptureAsync(adbPath, "reconnect offline", 2500);
+            if (_activeTransferCount == 0)
+            {
+                await RunCommandCaptureAsync(adbPath, "reconnect offline", 2500);
+            }
             await ScanAndSyncDevicesAsync(adbPath, silent: false);
             BtnRefreshDevices.IsEnabled = true;
         }
@@ -345,7 +379,8 @@ namespace FastAndroidDataCopier
 
             try
             {
-                string output = await RunCommandCaptureAsync(adbPath, "devices -l", 4000);
+                // Host-only query: does NOT open any shell on busy devices so active USB transfers are NEVER interrupted!
+                string output = await RunCommandCaptureAsync(adbPath, "devices -l", 3500);
                 var rawLines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
 
                 var currentSeenSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -371,9 +406,8 @@ namespace FastAndroidDataCopier
                         if (state != "device" && state != "unauthorized" && state != "offline" && state != "recovery")
                             continue;
 
-                        if (state == "offline")
+                        if (state == "offline" && _activeTransferCount == 0)
                         {
-                            // Automatically wake up re-plugged offline devices
                             await RunCommandCaptureAsync(adbPath, $"-s {serial} reconnect", 2000);
                         }
 
@@ -384,27 +418,11 @@ namespace FastAndroidDataCopier
                             model = modelPart.Substring(6).Replace("_", " ").Trim();
                         }
 
-                        if (string.IsNullOrWhiteSpace(model) && state == "device")
-                        {
-                            string propModel = (await RunCommandCaptureAsync(adbPath, $"-s {serial} shell getprop ro.product.model", 2500)).Trim();
-                            if (!string.IsNullOrWhiteSpace(propModel) && !propModel.Contains("error", StringComparison.OrdinalIgnoreCase))
-                            {
-                                model = propModel;
-                            }
-                        }
-
-                        if (string.IsNullOrWhiteSpace(model))
-                        {
-                            model = state == "unauthorized" ? "هاتف بانتظار السماح (Unauthorized)" : "Android Phone";
-                        }
-
                         currentSeenSerials.Add(serial);
                         parsedDevices.Add((serial, state, model));
                     }
                 }
 
-                // Remove disconnected devices that are not waiting for an interrupted copy resume,
-                // so re-plugging any previously connected phone is always recognized cleanly as a fresh active device!
                 foreach (var existing in ConnectedDevices.ToList())
                 {
                     if (!currentSeenSerials.Contains(existing.Serial))
@@ -428,11 +446,25 @@ namespace FastAndroidDataCopier
 
                 var devicesToAutoResume = new List<DeviceItem>();
 
-                foreach (var (serial, state, model) in parsedDevices)
+                foreach (var (serial, state, parsedModel) in parsedDevices)
                 {
                     var existing = ConnectedDevices.FirstOrDefault(d => string.Equals(d.Serial, serial, StringComparison.OrdinalIgnoreCase));
                     if (existing == null)
                     {
+                        string model = parsedModel;
+                        if (string.IsNullOrWhiteSpace(model) && state == "device")
+                        {
+                            string propModel = (await RunCommandCaptureAsync(adbPath, $"-s {serial} shell getprop ro.product.model", 2500)).Trim();
+                            if (!string.IsNullOrWhiteSpace(propModel) && !propModel.Contains("error", StringComparison.OrdinalIgnoreCase))
+                            {
+                                model = propModel;
+                            }
+                        }
+                        if (string.IsNullOrWhiteSpace(model))
+                        {
+                            model = state == "unauthorized" ? "هاتف بانتظار السماح (Unauthorized)" : "Android Phone";
+                        }
+
                         long freeBytes = state == "device" ? await GetDeviceFreeSpaceBytesAsync(adbPath, serial) : 0;
                         string initialStatus = state switch
                         {
@@ -463,12 +495,20 @@ namespace FastAndroidDataCopier
                     }
                     else
                     {
+                        // CRITICAL: Do NOT touch or query a device while it is actively copying!
+                        if (existing.IsBusy)
+                        {
+                            existing.IsDisconnected = false;
+                            existing.DeviceState = state;
+                            continue;
+                        }
+
                         bool wasDisconnectedOrNotReady = existing.IsDisconnected || existing.DeviceState != "device";
                         existing.Serial = serial;
                         existing.IsDisconnected = false;
                         existing.DeviceState = state;
-                        if (!string.IsNullOrWhiteSpace(model) && model != "Android Phone")
-                            existing.ModelName = model;
+                        if (!string.IsNullOrWhiteSpace(parsedModel) && parsedModel != "Android Phone")
+                            existing.ModelName = parsedModel;
 
                         if (state == "unauthorized")
                         {
@@ -490,12 +530,12 @@ namespace FastAndroidDataCopier
 
                             if (wasDisconnectedOrNotReady)
                             {
-                                if (existing.NeedsResume && ChkAutoResumeOnReconnect.IsChecked == true && !existing.IsBusy)
+                                if (existing.NeedsResume && ChkAutoResumeOnReconnect.IsChecked == true)
                                 {
                                     existing.Status = "🔄 تمت إعادة التوصيل! جاري الاستئناف التلقائي...";
                                     devicesToAutoResume.Add(existing);
                                 }
-                                else if (!existing.IsBusy)
+                                else
                                 {
                                     existing.Progress = 0;
                                     existing.Status = "جاهز للعمل ✅";
@@ -780,6 +820,7 @@ namespace FastAndroidDataCopier
             int conflictMode, bool useTarStream, CancellationToken token)
         {
             device.IsBusy = true;
+            Interlocked.Increment(ref _activeTransferCount);
             try
             {
                 var sourceDirInfo = new DirectoryInfo(sourceFolder);
@@ -802,24 +843,24 @@ namespace FastAndroidDataCopier
                     fullRemoteFolderPath = $"{normalizedTarget}{folderName}";
                 }
 
-                string escapedFullRemote = fullRemoteFolderPath.Replace("\"", "\\\"");
-                string escapedBaseParent = baseDestParent.Replace("\"", "\\\"");
+                string sqFullRemote = PhoneFolderBrowserDialog.EscapeSingleQuotes(fullRemoteFolderPath);
+                string sqBaseParent = PhoneFolderBrowserDialog.EscapeSingleQuotes(baseDestParent);
 
-                await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mkdir -p \"{escapedBaseParent}\"", 5000);
+                await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell \"mkdir -p '{sqBaseParent}'\"", 5000);
 
                 if (conflictMode == 0)
                 {
                     device.Status = "🗑 جاري حذف النسخة القديمة للاستبدال...";
                     device.AlreadyCopiedBytes = 0;
-                    await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell rm -rf \"{escapedFullRemote}\"", 15000);
+                    await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell \"rm -rf '{sqFullRemote}'\"", 20000);
                 }
                 else if (conflictMode == 3)
                 {
                     device.Status = "✏️ جاري إعادة تسمية المجلد القديم...";
                     device.AlreadyCopiedBytes = 0;
                     string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                    string renamedPath = $"{escapedFullRemote}_old_{timestamp}";
-                    await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mv \"{escapedFullRemote}\" \"{renamedPath}\"", 5000);
+                    string sqRenamed = PhoneFolderBrowserDialog.EscapeSingleQuotes($"{fullRemoteFolderPath}_old_{timestamp}");
+                    await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell \"if [ -d '{sqFullRemote}' ]; then mv '{sqFullRemote}' '{sqRenamed}'; fi\"", 5000);
                 }
 
                 Dictionary<string, long> remoteExistingFiles = new Dictionary<string, long>(StringComparer.Ordinal);
@@ -852,13 +893,13 @@ namespace FastAndroidDataCopier
 
                 if (resumePlan.TotalLocalFilesCount == 0)
                 {
-                    await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mkdir -p \"{escapedFullRemote}\"", 5000);
+                    await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell \"mkdir -p '{sqFullRemote}'\"", 5000);
                     device.Progress = 100;
                     device.Status = $"⚠️ المجلد المصدر فارغ! تم إنشاء {fullRemoteFolderPath}";
                     return;
                 }
 
-                if (conflictMode == 1 && resumePlan.MissingRelativeFiles.Count == 0 && resumePlan.PartialFiles.Count == 0 && _totalFolderBytes > 0)
+                if (conflictMode == 1 && resumePlan.MissingFiles.Count == 0 && _totalFolderBytes > 0)
                 {
                     device.Progress = 100;
                     device.NeedsResume = false;
@@ -870,19 +911,18 @@ namespace FastAndroidDataCopier
 
                 if (useTarStream)
                 {
-                    bool tarSuccess = await StreamTarWithSmartResumeAsync(device, adbPath, sourceFolder, baseDestParent, fullRemoteFolderPath, resumePlan, conflictMode == 1, token);
+                    bool tarSuccess = await StreamCustomTarArchiveAsync(device, adbPath, sourceFolder, baseDestParent, fullRemoteFolderPath, resumePlan, token);
                     if (!tarSuccess && !token.IsCancellationRequested)
                     {
-                        device.Status = "🔄 جاري التحويل التلقائي إلى ADB Push المضمون...";
+                        device.Status = "🔄 جاري إكمال النقل تلقائياً عبر ADB Push المضمون...";
                         var fallbackExisting = await GetRemoteExistingFilesAsync(adbPath, device.Serial, baseDestParent, folderName);
                         var fallbackPlan = await Task.Run(() => BuildTransferPlan(sourceFolder, fallbackExisting, isResumeMode: true));
-                        await AdbPushReliableAsync(device, adbPath, sourceFolder, baseDestParent, fullRemoteFolderPath, fallbackPlan, isResume: true, token);
+                        await AdbPushZeroShellContinuousAsync(device, adbPath, sourceFolder, baseDestParent, fullRemoteFolderPath, fallbackPlan, token);
                     }
                 }
                 else
                 {
-                    bool isResume = (conflictMode == 1) && (resumePlan.AlreadyCopiedBytes > 0 || resumePlan.PartialFiles.Count > 0);
-                    await AdbPushReliableAsync(device, adbPath, sourceFolder, baseDestParent, fullRemoteFolderPath, resumePlan, isResume, token);
+                    await AdbPushZeroShellContinuousAsync(device, adbPath, sourceFolder, baseDestParent, fullRemoteFolderPath, resumePlan, token);
                 }
 
                 device.FreeSpaceBytes = await GetDeviceFreeSpaceBytesAsync(adbPath, device.Serial);
@@ -901,38 +941,16 @@ namespace FastAndroidDataCopier
             finally
             {
                 device.IsBusy = false;
+                Interlocked.Decrement(ref _activeTransferCount);
             }
-        }
-
-        private async Task<long> GetRemoteDirectoryBytesAsync(string adbPath, string serial, string fullRemoteFolderPath)
-        {
-            try
-            {
-                string escaped = fullRemoteFolderPath.Replace("\"", "\\\"");
-                string outStr = await RunCommandCaptureAsync(adbPath, $"-s {serial} shell du -sk \"{escaped}\"", 3500);
-                if (!string.IsNullOrWhiteSpace(outStr))
-                {
-                    var line = outStr.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-                    if (line != null)
-                    {
-                        var parts = line.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                        if (parts.Length >= 1 && long.TryParse(parts[0], out long kb) && kb >= 0)
-                        {
-                            return kb * 1024L;
-                        }
-                    }
-                }
-            }
-            catch { }
-            return 0;
         }
 
         private async Task<int> CountRemoteFilesAsync(string adbPath, string serial, string fullRemoteFolderPath)
         {
             try
             {
-                string escaped = fullRemoteFolderPath.Replace("\"", "\\\"");
-                string output = await RunCommandCaptureAsync(adbPath, $"-s {serial} shell find \"{escaped}\" -type f", 8000);
+                string sq = PhoneFolderBrowserDialog.EscapeSingleQuotes(fullRemoteFolderPath);
+                string output = await RunCommandCaptureAsync(adbPath, $"-s {serial} shell \"find '{sq}' -type f 2>/dev/null\"", 10000);
                 if (string.IsNullOrWhiteSpace(output)) return 0;
                 int count = 0;
                 foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -958,10 +976,9 @@ namespace FastAndroidDataCopier
             var map = new Dictionary<string, long>(StringComparer.Ordinal);
             try
             {
-                string fullFolder = $"{baseDestParent}{folderName}".Replace("\"", "\\\"");
-                // Fast single-command listing using find -printf or ls -laR, with a strict 6s timeout so it never hangs
-                string cmd = $"-s {serial} shell find \"{fullFolder}\" -type f -exec stat -c \"%s|%n\" {{}} +";
-                string output = await RunCommandCaptureAsync(adbPath, cmd, 6000);
+                string sqFolder = PhoneFolderBrowserDialog.EscapeSingleQuotes($"{baseDestParent}{folderName}");
+                string cmd = $"-s {serial} shell \"find '{sqFolder}' -type f -exec stat -c '%s|%n' {{}} + 2>/dev/null\"";
+                string output = await RunCommandCaptureAsync(adbPath, cmd, 10000);
                 var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 foreach (var line in lines)
                 {
@@ -989,8 +1006,8 @@ namespace FastAndroidDataCopier
         {
             public int TotalLocalFilesCount { get; set; }
             public long AlreadyCopiedBytes { get; set; }
-            public List<string> MissingRelativeFiles { get; set; } = new List<string>();
-            public List<(FileInfo LocalFile, string RelativePath, long RemoteBytes)> PartialFiles { get; set; } = new List<(FileInfo, string, long)>();
+            public List<(FileInfo LocalFile, string RelativePath)> MissingFiles { get; set; } = new List<(FileInfo, string)>();
+            public List<string> AllRelativeDirectories { get; set; } = new List<string>();
         }
 
         private TransferResumePlan BuildTransferPlan(string sourceFolder, Dictionary<string, long> remoteFiles, bool isResumeMode)
@@ -999,293 +1016,211 @@ namespace FastAndroidDataCopier
             var rootDir = new DirectoryInfo(sourceFolder);
             string rootFolderName = rootDir.Name;
 
-            const long PartialResumeThreshold = 8L * 1024 * 1024;
-            const long BlockSize = 1024L * 1024L;
+            foreach (var dir in EnumerateDirectoriesSafe(rootDir))
+            {
+                string innerDirRel = Path.GetRelativePath(rootDir.FullName, dir.FullName).Replace('\\', '/');
+                string relDir = innerDirRel == "." ? rootFolderName : $"{rootFolderName}/{innerDirRel}";
+                plan.AllRelativeDirectories.Add(relDir);
+            }
 
             var allFiles = EnumerateFilesSafe(rootDir);
             foreach (FileInfo fi in allFiles)
             {
                 plan.TotalLocalFilesCount++;
-                // Safe relative path calculation that works even if sourceFolder is a drive root (e.g. D:\)
                 string innerRel = Path.GetRelativePath(rootDir.FullName, fi.FullName).Replace('\\', '/');
                 string relPath = $"{rootFolderName}/{innerRel}";
 
-                if (isResumeMode && remoteFiles.TryGetValue(relPath, out long remoteSize))
+                if (isResumeMode && remoteFiles.TryGetValue(relPath, out long remoteSize) && remoteSize == fi.Length && fi.Length > 0)
                 {
-                    if (remoteSize == fi.Length)
-                    {
-                        plan.AlreadyCopiedBytes += fi.Length;
-                    }
-                    else if (remoteSize > BlockSize && remoteSize < fi.Length && fi.Length >= PartialResumeThreshold)
-                    {
-                        long alignedBytes = (remoteSize / BlockSize) * BlockSize;
-                        plan.AlreadyCopiedBytes += alignedBytes;
-                        plan.PartialFiles.Add((fi, relPath, alignedBytes));
-                    }
-                    else
-                    {
-                        plan.MissingRelativeFiles.Add(relPath);
-                    }
+                    plan.AlreadyCopiedBytes += fi.Length;
                 }
                 else
                 {
-                    plan.MissingRelativeFiles.Add(relPath);
+                    plan.MissingFiles.Add((fi, relPath));
                 }
             }
 
             return plan;
         }
 
-        private class RefLong { public long Value; }
-        private class RefDouble { public double Value; }
-
-        private async Task CopyPartialFilesWithDdAsync(
-            DeviceItem device, string adbPath, string baseDestParent,
-            TransferResumePlan resumePlan, Stopwatch sw,
-            RefLong totalCopied, RefLong sessionBytes, RefLong lastReportedBytes, RefDouble lastReportTime,
-            CancellationToken token)
+        private async Task CreateRemoteDirectoriesBatchAsync(string adbPath, string serial, string baseDestParent, List<string> relativeDirs, CancellationToken token)
         {
-            foreach (var (localFile, relPath, alignedOffset) in resumePlan.PartialFiles)
+            if (relativeDirs.Count == 0) return;
+
+            var batch = new List<string>();
+            int currentCmdLen = 0;
+
+            foreach (var relDir in relativeDirs)
             {
                 token.ThrowIfCancellationRequested();
-                string remoteFilePath = $"{baseDestParent}{relPath}";
-                int lastSlash = remoteFilePath.LastIndexOf('/');
-                string remoteDirPath = lastSlash > 0 ? remoteFilePath.Substring(0, lastSlash) : baseDestParent;
-                await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mkdir -p \"{remoteDirPath.Replace("\"", "\\\"")}\"", 4000);
+                string fullRemoteDir = $"{baseDestParent}{relDir}";
+                string sq = $"'{PhoneFolderBrowserDialog.EscapeSingleQuotes(fullRemoteDir)}'";
+                batch.Add(sq);
+                currentCmdLen += sq.Length + 1;
 
-                long seekBlocks = alignedOffset / (1024L * 1024L);
-                var ddPsi = new ProcessStartInfo
+                if (currentCmdLen > 2500)
                 {
-                    FileName = adbPath,
-                    Arguments = $"-s {device.Serial} exec-in \"dd of='{remoteFilePath}' bs=1048576 seek={seekBlocks} conv=notrunc\"",
-                    UseShellExecute = false,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                using var ddProc = Process.Start(ddPsi)!;
-                using var fs = new FileStream(localFile.FullName, FileMode.Open, FileAccess.Read, FileShare.Read);
-                fs.Seek(alignedOffset, SeekOrigin.Begin);
-
-                byte[] buf = new byte[1024 * 1024];
-                int read;
-                using Stream ddIn = ddProc.StandardInput.BaseStream;
-                while ((read = await fs.ReadAsync(buf, 0, buf.Length, token)) > 0)
-                {
-                    await ddIn.WriteAsync(buf, 0, read, token);
-                    totalCopied.Value += read;
-                    sessionBytes.Value += read;
-                    device.AlreadyCopiedBytes = totalCopied.Value;
-
-                    double elapsed = sw.Elapsed.TotalSeconds;
-                    if (elapsed - lastReportTime.Value >= 0.35)
-                    {
-                        UpdateDeviceProgressUI(device, totalCopied.Value, sessionBytes.Value, lastReportedBytes.Value, elapsed, lastReportTime.Value);
-                        lastReportedBytes.Value = sessionBytes.Value;
-                        lastReportTime.Value = elapsed;
-                    }
+                    string joined = string.Join(" ", batch);
+                    await RunCommandCaptureAsync(adbPath, $"-s {serial} shell \"mkdir -p {joined}\"", 8000);
+                    batch.Clear();
+                    currentCmdLen = 0;
                 }
-                await ddIn.FlushAsync(token);
-                ddIn.Close();
-                await ddProc.WaitForExitAsync(token);
+            }
+
+            if (batch.Count > 0)
+            {
+                string joined = string.Join(" ", batch);
+                await RunCommandCaptureAsync(adbPath, $"-s {serial} shell \"mkdir -p {joined}\"", 8000);
             }
         }
 
-        private async Task AdbPushReliableAsync(
+        // =========================================================================
+        // METHOD 1: GUARANTEED CONTINUOUS ADB PUSH (Zero background shell interference!)
+        // =========================================================================
+        private async Task AdbPushZeroShellContinuousAsync(
             DeviceItem device, string adbPath, string sourceFolder, string baseDestParent, string fullRemoteFolderPath,
-            TransferResumePlan resumePlan, bool isResume, CancellationToken token)
+            TransferResumePlan resumePlan, CancellationToken token)
         {
-            var rootDir = new DirectoryInfo(sourceFolder);
-            string rootFolderName = rootDir.Name;
+            Dispatcher.Invoke(() =>
+            {
+                device.Status = "📂 جاري تهيئة هيكل المجلدات على الهاتف...";
+            });
 
-            var totalCopied = new RefLong { Value = resumePlan.AlreadyCopiedBytes };
-            var sessionBytes = new RefLong { Value = 0 };
-            var lastReportedBytes = new RefLong { Value = 0 };
-            var lastReportTime = new RefDouble { Value = 0 };
+            await CreateRemoteDirectoriesBatchAsync(adbPath, device.Serial, baseDestParent, resumePlan.AllRelativeDirectories, token);
+
+            long totalCopied = resumePlan.AlreadyCopiedBytes;
+            long sessionBytes = 0;
+            long lastReportedSessionBytes = 0;
+            double lastReportTime = 0;
             var sw = Stopwatch.StartNew();
 
-            // Fast Full-Folder ADB Push with live size monitoring when starting fresh or when few files were skipped
-            if (!isResume && resumePlan.PartialFiles.Count == 0)
-            {
-                await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mkdir -p \"{baseDestParent.Replace("\"", "\\\"")}\"", 5000);
-
-                Dispatcher.Invoke(() =>
-                {
-                    device.Progress = 0.5;
-                    device.Status = $"🚀 جاري النسخ السريع إلى {fullRemoteFolderPath}...";
-                    device.SpeedInfo = "جاري بدء النقل...";
-                });
-
-                string cleanSource = sourceFolder.TrimEnd('\\', '/');
-                var pushPsi = new ProcessStartInfo
-                {
-                    FileName = adbPath,
-                    Arguments = $"-s {device.Serial} push \"{cleanSource}\" \"{baseDestParent}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8,
-                    CreateNoWindow = true
-                };
-
-                using var pushProc = Process.Start(pushPsi)!;
-                var stdOutTask = pushProc.StandardOutput.ReadToEndAsync();
-                var stdErrTask = pushProc.StandardError.ReadToEndAsync();
-
-                long lastBytes = 0;
-                double lastSec = 0;
-
-                while (!pushProc.HasExited)
-                {
-                    if (token.IsCancellationRequested)
-                    {
-                        try { pushProc.Kill(entireProcessTree: true); } catch { }
-                        token.ThrowIfCancellationRequested();
-                    }
-
-                    await Task.Delay(500, token);
-                    long currentRemoteBytes = await GetRemoteDirectoryBytesAsync(adbPath, device.Serial, fullRemoteFolderPath);
-                    double elapsed = sw.Elapsed.TotalSeconds;
-
-                    if (currentRemoteBytes > 0)
-                    {
-                        device.AlreadyCopiedBytes = currentRemoteBytes;
-                        long deltaBytes = Math.Max(0, currentRemoteBytes - lastBytes);
-                        UpdateDeviceProgressUI(device, currentRemoteBytes, currentRemoteBytes, lastBytes, elapsed, lastSec);
-                        lastBytes = currentRemoteBytes;
-                        lastSec = elapsed;
-                    }
-                }
-
-                string stdOut = await stdOutTask;
-                string stdErr = await stdErrTask;
-
-                int copiedFilesCount = await CountRemoteFilesAsync(adbPath, device.Serial, fullRemoteFolderPath);
-                if (pushProc.ExitCode == 0 && copiedFilesCount > 0)
-                {
-                    device.Progress = 100;
-                    device.NeedsResume = false;
-                    device.Status = $"✅ تم نسخ {copiedFilesCount} ملف بنجاح إلى: {fullRemoteFolderPath}";
-                    double totalGb = _totalFolderBytes / (1024.0 * 1024.0 * 1024.0);
-                    device.SpeedInfo = $"{totalGb:F2}/{totalGb:F2} GB ({copiedFilesCount} ملف مكتمل)";
-                    return;
-                }
-                // If whole-folder push failed or only created an empty directory, fall through to per-file push automatically!
-            }
-
-            // Per-file smart resume & fallback push
-            await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mkdir -p \"{fullRemoteFolderPath.Replace("\"", "\\\"")}\"", 5000);
-
-            double initialPercent = _totalFolderBytes > 0 ? Math.Min(99.9, (totalCopied.Value * 100.0) / _totalFolderBytes) : 0;
+            double initialPercent = _totalFolderBytes > 0 ? Math.Min(99.9, (totalCopied * 100.0) / _totalFolderBytes) : 0;
             Dispatcher.Invoke(() =>
             {
                 device.Progress = Math.Max(0.5, initialPercent);
-                device.Status = totalCopied.Value > 0
+                device.Status = totalCopied > 0
                     ? $"⏯ استئناف النقل المضمون من {initialPercent:F1}%..."
-                    : $"📁 جاري نسخ الملفات إلى {fullRemoteFolderPath}...";
+                    : $"📁 جاري النسخ المباشر المضمون ({resumePlan.MissingFiles.Count} ملف)...";
             });
 
-            if (resumePlan.PartialFiles.Count > 0)
-            {
-                await CopyPartialFilesWithDdAsync(device, adbPath, baseDestParent, resumePlan, sw, totalCopied, sessionBytes, lastReportedBytes, lastReportTime, token);
-            }
+            int totalFilesToCopy = resumePlan.MissingFiles.Count;
+            int currentIdx = 0;
 
-            var createdDirs = new HashSet<string>(StringComparer.Ordinal);
-            int totalFiles = resumePlan.MissingRelativeFiles.Count;
-            int currentFileIndex = 0;
-
-            foreach (var relPath in resumePlan.MissingRelativeFiles)
+            foreach (var (fi, relPath) in resumePlan.MissingFiles)
             {
                 token.ThrowIfCancellationRequested();
-                currentFileIndex++;
+                currentIdx++;
 
-                string innerRel = relPath.StartsWith(rootFolderName + "/", StringComparison.OrdinalIgnoreCase)
-                    ? relPath.Substring(rootFolderName.Length + 1)
-                    : relPath;
-
-                string localFile = Path.Combine(rootDir.FullName, innerRel.Replace('/', Path.DirectorySeparatorChar));
-                var fi = new FileInfo(localFile);
                 if (!fi.Exists) continue;
 
+                string localFile = fi.FullName;
                 string remoteFile = $"{baseDestParent}{relPath}";
-                int lastSlash = remoteFile.LastIndexOf('/');
-                if (lastSlash > 0)
-                {
-                    string remoteDir = remoteFile.Substring(0, lastSlash);
-                    if (createdDirs.Add(remoteDir))
-                    {
-                        await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell mkdir -p \"{remoteDir.Replace("\"", "\\\"")}\"", 4000);
-                    }
-                }
 
                 Dispatcher.Invoke(() =>
                 {
-                    device.Status = $"📁 جاري نسخ ({currentFileIndex}/{totalFiles}): {fi.Name}";
+                    device.Status = $"📁 نسخ ({currentIdx}/{totalFilesToCopy}): {fi.Name}";
                 });
 
-                var psi = new ProcessStartInfo
+                bool pushedOk = false;
+                string lastError = "";
+
+                for (int attempt = 1; attempt <= 2; attempt++)
                 {
-                    FileName = adbPath,
-                    Arguments = $"-s {device.Serial} push \"{localFile}\" \"{remoteFile}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8,
-                    CreateNoWindow = true
-                };
+                    token.ThrowIfCancellationRequested();
 
-                using var proc = Process.Start(psi)!;
-                var stdOutTask = proc.StandardOutput.ReadToEndAsync();
-                var stdErrTask = proc.StandardError.ReadToEndAsync();
-
-                while (!proc.HasExited)
-                {
-                    if (token.IsCancellationRequested)
+                    var psi = new ProcessStartInfo
                     {
-                        try { proc.Kill(entireProcessTree: true); } catch { }
-                        token.ThrowIfCancellationRequested();
-                    }
+                        FileName = adbPath,
+                        Arguments = $"-s {device.Serial} push \"{localFile}\" \"{remoteFile}\"",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        StandardOutputEncoding = Encoding.UTF8,
+                        StandardErrorEncoding = Encoding.UTF8,
+                        CreateNoWindow = true
+                    };
 
-                    await Task.Delay(350, token);
-                    if (fi.Length >= 4 * 1024 * 1024)
+                    using var proc = Process.Start(psi)!;
+                    var stdOutTask = proc.StandardOutput.ReadToEndAsync();
+                    var stdErrTask = proc.StandardError.ReadToEndAsync();
+
+                    long fileLen = fi.Length;
+                    long baseCopiedBeforeFile = totalCopied;
+                    long baseSessionBeforeFile = sessionBytes;
+
+                    // Pure time-interpolated UI update during large single-file push — NO concurrent adb shell commands!
+                    while (!proc.HasExited)
                     {
-                        long currentRemoteBytes = await GetRemoteDirectoryBytesAsync(adbPath, device.Serial, fullRemoteFolderPath);
-                        if (currentRemoteBytes > totalCopied.Value)
+                        if (token.IsCancellationRequested)
+                        {
+                            try { proc.Kill(entireProcessTree: true); } catch { }
+                            token.ThrowIfCancellationRequested();
+                        }
+
+                        await Task.Delay(250, token);
+
+                        if (fileLen > 2 * 1024 * 1024 && !proc.HasExited)
                         {
                             double el = sw.Elapsed.TotalSeconds;
-                            long sess = currentRemoteBytes - resumePlan.AlreadyCopiedBytes;
-                            UpdateDeviceProgressUI(device, currentRemoteBytes, sess, lastReportedBytes.Value, el, lastReportTime.Value);
-                            lastReportedBytes.Value = sess;
-                            lastReportTime.Value = el;
+                            double avgSpeedBytesPerSec = el > 0.5 && sessionBytes > 0
+                                ? sessionBytes / el
+                                : 18.0 * 1024 * 1024; // Estimate 18 MB/s on first large file
+
+                            double fileElapsed = Math.Max(0.1, el - lastReportTime);
+                            long estimatedInFlight = (long)Math.Min(fileLen * 0.94, fileElapsed * avgSpeedBytesPerSec);
+                            long estTotal = baseCopiedBeforeFile + estimatedInFlight;
+                            double pct = _totalFolderBytes > 0 ? Math.Min(99.5, (estTotal * 100.0) / _totalFolderBytes) : 50;
+                            double copiedGb = Math.Min(_totalFolderBytes, estTotal) / (1024.0 * 1024.0 * 1024.0);
+                            double totalGb = _totalFolderBytes / (1024.0 * 1024.0 * 1024.0);
+                            double mbps = avgSpeedBytesPerSec / (1024.0 * 1024.0);
+
+                            Dispatcher.Invoke(() =>
+                            {
+                                if (pct > device.Progress) device.Progress = pct;
+                                device.SpeedInfo = $"{copiedGb:F2}/{totalGb:F2} GB (~{mbps:F1} MB/s)";
+                            });
                         }
+                    }
+
+                    string stdOut = await stdOutTask;
+                    string stdErr = await stdErrTask;
+
+                    if (proc.ExitCode == 0)
+                    {
+                        pushedOk = true;
+                        break;
+                    }
+
+                    lastError = string.IsNullOrWhiteSpace(stdErr) ? stdOut : stdErr;
+                    if (attempt == 1)
+                    {
+                        int lastSlash = remoteFile.LastIndexOf('/');
+                        if (lastSlash > 0)
+                        {
+                            string sqParent = PhoneFolderBrowserDialog.EscapeSingleQuotes(remoteFile.Substring(0, lastSlash));
+                            await RunCommandCaptureAsync(adbPath, $"-s {device.Serial} shell \"mkdir -p '{sqParent}'\"", 4000);
+                        }
+                        await Task.Delay(300, token);
                     }
                 }
 
-                string stdOut = await stdOutTask;
-                string stdErr = await stdErrTask;
-
-                if (proc.ExitCode != 0)
+                if (!pushedOk)
                 {
                     device.NeedsResume = true;
-                    string errMsg = string.IsNullOrWhiteSpace(stdErr) ? stdOut : stdErr;
-                    device.Status = $"⚠️ فشل نسخ {fi.Name}: {errMsg.Trim()}";
+                    device.Status = $"⚠️ توقف عند {fi.Name}: {lastError.Trim()} (اضغط استئناف)";
                     return;
                 }
 
-                totalCopied.Value += fi.Length;
-                sessionBytes.Value += fi.Length;
-                device.AlreadyCopiedBytes = totalCopied.Value;
+                totalCopied += fi.Length;
+                sessionBytes += fi.Length;
+                device.AlreadyCopiedBytes = totalCopied;
 
                 double elapsed = sw.Elapsed.TotalSeconds;
-                if (elapsed - lastReportTime.Value >= 0.2 || currentFileIndex == totalFiles)
+                if (elapsed - lastReportTime >= 0.15 || currentIdx == totalFilesToCopy)
                 {
-                    UpdateDeviceProgressUI(device, totalCopied.Value, sessionBytes.Value, lastReportedBytes.Value, elapsed, lastReportTime.Value);
-                    lastReportedBytes.Value = sessionBytes.Value;
-                    lastReportTime.Value = elapsed;
+                    UpdateDeviceProgressUI(device, totalCopied, sessionBytes, lastReportedSessionBytes, elapsed, lastReportTime);
+                    lastReportedSessionBytes = sessionBytes;
+                    lastReportTime = elapsed;
                 }
             }
 
@@ -1305,76 +1240,35 @@ namespace FastAndroidDataCopier
             }
         }
 
-        private async Task<bool> StreamTarWithSmartResumeAsync(
+        // =========================================================================
+        // METHOD 2: BUILT-IN PURE C# USTAR STREAMER (No Windows tar.exe dependency!)
+        // =========================================================================
+        private async Task<bool> StreamCustomTarArchiveAsync(
             DeviceItem device, string adbPath, string sourceFolder, string baseDestParent, string fullRemoteFolderPath,
-            TransferResumePlan resumePlan, bool isResumeMode, CancellationToken token)
+            TransferResumePlan resumePlan, CancellationToken token)
         {
-            var rootDir = new DirectoryInfo(sourceFolder);
-            string parentDir = rootDir.Parent?.FullName ?? rootDir.FullName;
-            string folderName = rootDir.Name;
+            await CreateRemoteDirectoriesBatchAsync(adbPath, device.Serial, baseDestParent, resumePlan.AllRelativeDirectories, token);
 
-            var totalCopied = new RefLong { Value = resumePlan.AlreadyCopiedBytes };
-            var sessionBytes = new RefLong { Value = 0 };
-            var lastReportedBytes = new RefLong { Value = 0 };
-            var lastReportTime = new RefDouble { Value = 0 };
+            long totalCopied = resumePlan.AlreadyCopiedBytes;
+            long sessionBytes = 0;
+            long lastReportedBytes = 0;
+            double lastReportTime = 0;
             var sw = Stopwatch.StartNew();
 
-            double initialPercent = _totalFolderBytes > 0 ? Math.Min(99.9, (totalCopied.Value * 100.0) / _totalFolderBytes) : 0;
-
+            double initialPercent = _totalFolderBytes > 0 ? Math.Min(99.9, (totalCopied * 100.0) / _totalFolderBytes) : 0;
             Dispatcher.Invoke(() =>
             {
-                device.Progress = initialPercent;
-                device.Status = totalCopied.Value > 0
-                    ? $"⏯ استئناف من {initialPercent:F1}%..."
-                    : "⚡ جاري البث السريع (TAR Stream)...";
+                device.Progress = Math.Max(0.5, initialPercent);
+                device.Status = totalCopied > 0
+                    ? $"⏯ استئناف بث TAR من {initialPercent:F1}%..."
+                    : "⚡ جاري البث المباشر فائق السرعة (TAR Stream)...";
             });
 
-            if (resumePlan.PartialFiles.Count > 0)
-            {
-                await CopyPartialFilesWithDdAsync(device, adbPath, baseDestParent, resumePlan, sw, totalCopied, sessionBytes, lastReportedBytes, lastReportTime, token);
-            }
-
-            if (isResumeMode && resumePlan.AlreadyCopiedBytes > 0 && resumePlan.MissingRelativeFiles.Count == 0)
-            {
-                int count = await CountRemoteFilesAsync(adbPath, device.Serial, fullRemoteFolderPath);
-                if (count > 0)
-                {
-                    device.Progress = 100;
-                    device.NeedsResume = false;
-                    device.Status = $"✅ مكتمل ({count} ملف) في {fullRemoteFolderPath}";
-                    return true;
-                }
-                return false;
-            }
-
-            string? tempListFile = null;
-            string tarArgs;
-
-            if (isResumeMode && resumePlan.AlreadyCopiedBytes > 0 && resumePlan.MissingRelativeFiles.Count > 0)
-            {
-                tempListFile = Path.Combine(Path.GetTempPath(), $"tar_resume_{device.Serial}_{Guid.NewGuid():N}.txt");
-                await File.WriteAllLinesAsync(tempListFile, resumePlan.MissingRelativeFiles, new UTF8Encoding(false), token);
-                tarArgs = $"--format=ustar -cf - -C \"{parentDir}\" -T \"{tempListFile}\"";
-            }
-            else
-            {
-                tarArgs = $"--format=ustar -cf - -C \"{parentDir}\" \"{folderName}\"";
-            }
-
-            var tarPsi = new ProcessStartInfo
-            {
-                FileName = "tar.exe",
-                Arguments = tarArgs,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
+            string sqBaseParent = PhoneFolderBrowserDialog.EscapeSingleQuotes(baseDestParent);
             var adbPsi = new ProcessStartInfo
             {
                 FileName = adbPath,
-                Arguments = $"-s {device.Serial} exec-in \"mkdir -p '{baseDestParent}' && tar -xf - -C '{baseDestParent}'\"",
+                Arguments = $"-s {device.Serial} exec-in \"tar -xf - -C '{sqBaseParent}'\"",
                 UseShellExecute = false,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
@@ -1382,47 +1276,98 @@ namespace FastAndroidDataCopier
                 CreateNoWindow = true
             };
 
-            using var tarProcess = new Process { StartInfo = tarPsi };
             using var adbProcess = new Process { StartInfo = adbPsi };
-
             try
             {
-                tarProcess.Start();
                 adbProcess.Start();
+                var errTask = adbProcess.StandardError.ReadToEndAsync();
+                var outTask = adbProcess.StandardOutput.ReadToEndAsync();
 
-                using Stream sourceStream = tarProcess.StandardOutput.BaseStream;
                 using Stream destStream = adbProcess.StandardInput.BaseStream;
+                byte[] buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+                byte[] zeroPadding = new byte[512];
 
-                byte[] buffer = new byte[1024 * 1024];
-                int bytesRead;
-
-                while ((bytesRead = await sourceStream.ReadAsync(buffer, 0, buffer.Length, token)) > 0)
+                try
                 {
-                    await destStream.WriteAsync(buffer, 0, bytesRead, token);
-                    totalCopied.Value += bytesRead;
-                    sessionBytes.Value += bytesRead;
-                    device.AlreadyCopiedBytes = totalCopied.Value;
+                    int totalFiles = resumePlan.MissingFiles.Count;
+                    int idx = 0;
 
-                    double elapsedSec = sw.Elapsed.TotalSeconds;
-                    if (elapsedSec - lastReportTime.Value >= 0.35)
+                    foreach (var (fi, relPath) in resumePlan.MissingFiles)
                     {
-                        UpdateDeviceProgressUI(device, totalCopied.Value, sessionBytes.Value, lastReportedBytes.Value, elapsedSec, lastReportTime.Value);
-                        lastReportedBytes.Value = sessionBytes.Value;
-                        lastReportTime.Value = elapsedSec;
+                        token.ThrowIfCancellationRequested();
+                        idx++;
+                        if (!fi.Exists) continue;
+
+                        Dispatcher.Invoke(() =>
+                        {
+                            device.Status = $"⚡ بث TAR ({idx}/{totalFiles}): {fi.Name}";
+                        });
+
+                        byte[] header = CreatePosixTarHeader(relPath, fi.Length, fi.LastWriteTimeUtc);
+                        await destStream.WriteAsync(header, 0, 512, token);
+
+                        long remaining = fi.Length;
+                        using (var fs = new FileStream(fi.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 256 * 1024, useAsync: true))
+                        {
+                            while (remaining > 0)
+                            {
+                                int toRead = (int)Math.Min(buffer.Length, remaining);
+                                int read = await fs.ReadAsync(buffer, 0, toRead, token);
+                                if (read <= 0) break;
+
+                                await destStream.WriteAsync(buffer, 0, read, token);
+                                remaining -= read;
+                                totalCopied += read;
+                                sessionBytes += read;
+                                device.AlreadyCopiedBytes = totalCopied;
+
+                                double elapsedSec = sw.Elapsed.TotalSeconds;
+                                if (elapsedSec - lastReportTime >= 0.2)
+                                {
+                                    UpdateDeviceProgressUI(device, totalCopied, sessionBytes, lastReportedBytes, elapsedSec, lastReportTime);
+                                    lastReportedBytes = sessionBytes;
+                                    lastReportTime = elapsedSec;
+                                }
+                            }
+                        }
+
+                        // If file shrank while reading, pad remaining bytes with zeros so TAR stream stays aligned
+                        while (remaining > 0)
+                        {
+                            int pad = (int)Math.Min(512, remaining);
+                            await destStream.WriteAsync(zeroPadding, 0, pad, token);
+                            remaining -= pad;
+                        }
+
+                        int remainder512 = (int)(fi.Length % 512);
+                        if (remainder512 > 0)
+                        {
+                            int pad512 = 512 - remainder512;
+                            await destStream.WriteAsync(zeroPadding, 0, pad512, token);
+                        }
                     }
+
+                    // Write two 512-byte zero blocks to mark EOF of TAR archive
+                    await destStream.WriteAsync(zeroPadding, 0, 512, token);
+                    await destStream.WriteAsync(zeroPadding, 0, 512, token);
+                    await destStream.FlushAsync(token);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
 
-                await destStream.FlushAsync(token);
                 destStream.Close();
-
                 await adbProcess.WaitForExitAsync(token);
+                string _ = await errTask;
+                string __ = await outTask;
 
                 int verifiedCount = await CountRemoteFilesAsync(adbPath, device.Serial, fullRemoteFolderPath);
-                if (adbProcess.ExitCode == 0 && verifiedCount > 0)
+                if (adbProcess.ExitCode == 0 && verifiedCount >= resumePlan.MissingFiles.Count)
                 {
                     device.Progress = 100;
                     device.NeedsResume = false;
-                    device.Status = $"✅ تم نسخ {verifiedCount} ملف بنجاح إلى: {fullRemoteFolderPath}";
+                    device.Status = $"✅ تم بث ونسخ {verifiedCount} ملف بنجاح إلى: {fullRemoteFolderPath}";
                     double totalGb = _totalFolderBytes / (1024.0 * 1024.0 * 1024.0);
                     device.SpeedInfo = $"{totalGb:F2}/{totalGb:F2} GB ({verifiedCount} ملف مكتمل)";
                     return true;
@@ -1432,23 +1377,101 @@ namespace FastAndroidDataCopier
             }
             catch (OperationCanceledException)
             {
-                try { tarProcess.Kill(); } catch { }
-                try { adbProcess.Kill(); } catch { }
+                try { adbProcess.Kill(entireProcessTree: true); } catch { }
                 throw;
             }
             catch
             {
-                try { tarProcess.Kill(); } catch { }
-                try { adbProcess.Kill(); } catch { }
+                try { adbProcess.Kill(entireProcessTree: true); } catch { }
                 return false;
             }
-            finally
+        }
+
+        private static byte[] CreatePosixTarHeader(string relativePath, long fileSize, DateTime lastModifiedUtc)
+        {
+            byte[] header = new byte[512];
+            string cleanPath = relativePath.Replace('\\', '/').TrimStart('/');
+
+            byte[] pathBytes = Encoding.UTF8.GetBytes(cleanPath);
+            if (pathBytes.Length <= 100)
             {
-                if (tempListFile != null && File.Exists(tempListFile))
+                Array.Copy(pathBytes, 0, header, 0, pathBytes.Length);
+            }
+            else
+            {
+                // Split into prefix (up to 155 bytes at offset 345) and name (up to 100 bytes at offset 0)
+                int splitSlash = cleanPath.LastIndexOf('/');
+                while (splitSlash > 0 && Encoding.UTF8.GetByteCount(cleanPath.Substring(splitSlash + 1)) > 100)
                 {
-                    try { File.Delete(tempListFile); } catch { }
+                    splitSlash = cleanPath.LastIndexOf('/', splitSlash - 1);
+                }
+
+                if (splitSlash > 0)
+                {
+                    string prefix = cleanPath.Substring(0, splitSlash);
+                    string name = cleanPath.Substring(splitSlash + 1);
+                    byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+                    byte[] prefixBytes = Encoding.UTF8.GetBytes(prefix);
+                    Array.Copy(nameBytes, 0, header, 0, Math.Min(100, nameBytes.Length));
+                    Array.Copy(prefixBytes, 0, header, 345, Math.Min(155, prefixBytes.Length));
+                }
+                else
+                {
+                    Array.Copy(pathBytes, 0, header, 0, 100);
                 }
             }
+
+            WriteOctalString(header, 100, 8, 420); // 0644 permissions (decimal 420)
+            WriteOctalString(header, 108, 8, 0);   // uid
+            WriteOctalString(header, 116, 8, 0);   // gid
+
+            if (fileSize < 8589934591L) // < 8 GB fits in standard octal
+            {
+                WriteOctalString(header, 124, 12, fileSize);
+            }
+            else
+            {
+                // Base-256 extension for files >= 8 GB
+                header[124] = 0x80;
+                long val = fileSize;
+                for (int i = 135; i >= 125; i--)
+                {
+                    header[i] = (byte)(val & 0xFF);
+                    val >>= 8;
+                }
+            }
+
+            long unixTime = Math.Max(0, (long)(lastModifiedUtc - DateTime.UnixEpoch).TotalSeconds);
+            WriteOctalString(header, 136, 12, unixTime);
+
+            // Fill checksum field with spaces initially
+            for (int i = 148; i < 156; i++) header[i] = 0x20;
+
+            header[156] = (byte)'0'; // Regular file
+
+            // ustar magic + version
+            byte[] magic = Encoding.ASCII.GetBytes("ustar\00000");
+            Array.Copy(magic, 0, header, 257, magic.Length);
+
+            long checksum = 0;
+            for (int i = 0; i < 512; i++) checksum += header[i];
+
+            string chkOctal = Convert.ToString(checksum, 8).PadLeft(6, '0');
+            byte[] chkBytes = Encoding.ASCII.GetBytes(chkOctal);
+            Array.Copy(chkBytes, 0, header, 148, 6);
+            header[154] = 0;
+            header[155] = 0x20;
+
+            return header;
+        }
+
+        private static void WriteOctalString(byte[] buffer, int offset, int length, long value)
+        {
+            string octal = Convert.ToString(value, 8).PadLeft(length - 1, '0');
+            byte[] bytes = Encoding.ASCII.GetBytes(octal);
+            int copyLen = Math.Min(length - 1, bytes.Length);
+            Array.Copy(bytes, bytes.Length - copyLen, buffer, offset, copyLen);
+            buffer[offset + length - 1] = 0;
         }
 
         private void UpdateDeviceProgressUI(DeviceItem device, long totalCopied, long sessionBytes, long lastReportedBytes, double elapsedSec, double lastReportTime)

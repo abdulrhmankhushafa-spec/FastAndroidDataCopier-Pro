@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -14,26 +15,31 @@ namespace FastAndroidDataCopier
     {
         private readonly string _adbPath;
         private readonly string _serial;
-        public string SelectedPath { get; private set; } = "/sdcard/";
+        public string SelectedPath { get; private set; } = "/sdcard/Download/";
 
         public PhoneFolderBrowserDialog(string adbPath, string serial, string initialPath)
         {
             InitializeComponent();
             _adbPath = adbPath;
             _serial = serial;
-            SelectedPath = NormalizeRemotePath(string.IsNullOrWhiteSpace(initialPath) ? "/sdcard/" : initialPath);
+            SelectedPath = NormalizeRemotePath(string.IsNullOrWhiteSpace(initialPath) ? "/sdcard/Download/" : initialPath);
             TxtCurrentRemotePath.Text = SelectedPath;
             Loaded += async (_, __) => await LoadDirectoriesAsync(SelectedPath);
         }
 
         public static string NormalizeRemotePath(string path)
         {
-            string p = (path ?? "/sdcard/").Trim().Replace('\\', '/');
-            if (string.IsNullOrWhiteSpace(p)) p = "/sdcard/";
+            string p = (path ?? "/sdcard/Download/").Trim().Replace('\\', '/');
+            if (string.IsNullOrWhiteSpace(p)) p = "/sdcard/Download/";
             if (!p.StartsWith("/")) p = "/" + p;
             while (p.Contains("//")) p = p.Replace("//", "/");
             if (!p.EndsWith("/")) p += "/";
             return p;
+        }
+
+        public static string EscapeSingleQuotes(string s)
+        {
+            return (s ?? "").Replace("'", "'\\''");
         }
 
         private async Task LoadDirectoriesAsync(string remotePath)
@@ -46,10 +52,10 @@ namespace FastAndroidDataCopier
 
             try
             {
-                string escapedNorm = norm.Replace("\"", "\\\"");
-                await RunAdbAsync($"-s {_serial} shell mkdir -p \"{escapedNorm}\"");
+                string sqNorm = EscapeSingleQuotes(norm);
+                await RunAdbAsync($"-s {_serial} shell \"mkdir -p '{sqNorm}' 2>/dev/null\"");
 
-                var (_, stdout1, _) = await RunAdbAsync($"-s {_serial} shell ls -1 -p \"{escapedNorm}\"");
+                var (_, stdout1, _) = await RunAdbAsync($"-s {_serial} shell \"ls -1 -p '{sqNorm}' 2>/dev/null\"");
 
                 var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -78,7 +84,7 @@ namespace FastAndroidDataCopier
 
                 if (dirs.Count == 0)
                 {
-                    var (_, stdout2, _) = await RunAdbAsync($"-s {_serial} shell find \"{escapedNorm}\" -maxdepth 1 -mindepth 1 -type d");
+                    var (_, stdout2, _) = await RunAdbAsync($"-s {_serial} shell \"find '{sqNorm}' -maxdepth 1 -mindepth 1 -type d 2>/dev/null\"");
                     if (!string.IsNullOrWhiteSpace(stdout2))
                     {
                         foreach (var raw in stdout2.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
@@ -106,7 +112,7 @@ namespace FastAndroidDataCopier
 
                 TxtBrowserStatus.Text = dirs.Count > 0
                     ? $"✅ تم العثور على {dirs.Count} مجلد داخل {norm} (انقر مرتين للدخول أو اضغط اعتماد المسار)."
-                    : $"📂 المجلد {norm} جاهز للنسخ (لا توجد مجلدات فرعية ظاهرة بداخله).";
+                    : $"📂 المسار {norm} جاهز للنسخ (لا توجد مجلدات فرعية ظاهرة بداخله).";
             }
             catch (Exception ex)
             {
@@ -169,8 +175,8 @@ namespace FastAndroidDataCopier
             }
 
             string target = NormalizeRemotePath(TxtCurrentRemotePath.Text) + newName + "/";
-            string escapedTarget = target.Replace("\"", "\\\"");
-            await RunAdbAsync($"-s {_serial} shell mkdir -p \"{escapedTarget}\"");
+            string sqTarget = EscapeSingleQuotes(target);
+            await RunAdbAsync($"-s {_serial} shell \"mkdir -p '{sqTarget}'\"");
             TxtNewFolderName.Text = "";
             await LoadDirectoriesAsync(target);
         }
@@ -207,7 +213,7 @@ namespace FastAndroidDataCopier
             Close();
         }
 
-        private async Task<(int ExitCode, string StdOut, string StdErr)> RunAdbAsync(string args)
+        private async Task<(int ExitCode, string StdOut, string StdErr)> RunAdbAsync(string args, int timeoutMs = 8000)
         {
             var psi = new ProcessStartInfo
             {
@@ -223,7 +229,18 @@ namespace FastAndroidDataCopier
             using var p = Process.Start(psi)!;
             var outTask = p.StandardOutput.ReadToEndAsync();
             var errTask = p.StandardError.ReadToEndAsync();
-            await p.WaitForExitAsync();
+
+            using var cts = new CancellationTokenSource(timeoutMs);
+            try
+            {
+                await p.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { p.Kill(entireProcessTree: true); } catch { }
+                return (-1, "", "Timeout");
+            }
+
             return (p.ExitCode, await outTask, await errTask);
         }
     }
